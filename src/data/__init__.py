@@ -1,25 +1,32 @@
 """
-Data Preparation Module
-======================
+Data Preparation Module for Bible Translation
+============================================
 
-This module handles all data preparation tasks for the Bible translation project:
-- Text preprocessing and tokenization
-- Vocabulary building and management
-- Data loading and batching
-- Sequence padding and masking
-- Data augmentation techniques
+This module provides all the necessary components for preparing and processing
+parallel text data for training the Transformer model.
+
+Components:
+- TextPreprocessor: Text cleaning and normalization
+- Tokenizer: Text tokenization (character, word, subword)
+- Vocabulary: Dual-language vocabulary management
+- DataLoader: Batch generation and sequence padding
+- DataAugmentation: Data augmentation techniques
+- AmharicOromiffaDataset: Real dataset handler for parallel text
 """
 
 from .text_preprocessor import TextPreprocessor
+from .tokenizer import Tokenizer
 from .vocabulary import Vocabulary
 from .data_loader import DataLoader
-from .tokenizer import Tokenizer
 from .augmentation import DataAugmentation
+from .amharic_oromiffa_dataset import AmharicOromiffaDataset, create_progressive_dataset
 
 __all__ = [
     'TextPreprocessor',
-    'Vocabulary', 
+    'Tokenizer', 
+    'Vocabulary',
     'DataLoader',
-    'Tokenizer',
-    'DataAugmentation'
+    'DataAugmentation',
+    'AmharicOromiffaDataset',
+    'create_progressive_dataset'
 ]
