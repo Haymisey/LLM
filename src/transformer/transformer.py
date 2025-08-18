@@ -255,8 +255,9 @@ class Transformer:
         return decoded, decoder_attention_weights
     
     def forward(self, src_tokens: np.ndarray, tgt_tokens: np.ndarray,
-                src_mask: Optional[np.ndarray] = None,
-                tgt_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+                src_padding_mask: Optional[np.ndarray] = None,
+                tgt_padding_mask: Optional[np.ndarray] = None,
+                look_ahead_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Forward pass through the complete Transformer.
         
@@ -270,11 +271,13 @@ class Transformer:
             Logits and attention weights dictionary
         """
         # Encode source sequence
-        encoder_output, encoder_attention_weights = self.encode(src_tokens, src_mask)
+        encoder_output, encoder_attention_weights = self.encode(src_tokens, src_padding_mask)
         
         # Decode target sequence
+        # Combine target masks if provided (padding and causal/look-ahead)
+        combined_tgt_mask = self._combine_target_masks(tgt_padding_mask, look_ahead_mask, tgt_tokens.shape[1])
         decoder_output, decoder_attention_weights = self.decode(
-            tgt_tokens, encoder_output, tgt_mask, src_mask
+            tgt_tokens, encoder_output, combined_tgt_mask, src_padding_mask
         )
         
         # Project to vocabulary
@@ -341,7 +344,7 @@ class Transformer:
             tgt_mask = self._create_causal_mask(tgt_tokens.shape[1])
             
             # Get predictions
-            logits, _ = self.forward(src_tokens, tgt_tokens, tgt_mask=tgt_mask)
+            logits, _ = self.forward(src_tokens, tgt_tokens, look_ahead_mask=tgt_mask)
             
             # Get next token (greedy)
             next_token_logits = logits[:, -1, :] / temperature
@@ -360,6 +363,118 @@ class Transformer:
         """Create causal mask for decoder self-attention."""
         mask = np.triu(np.ones((seq_len, seq_len)), k=1).astype(bool)
         return mask.reshape(1, 1, seq_len, seq_len)
+
+    def _combine_target_masks(self,
+                              tgt_padding_mask: Optional[np.ndarray],
+                              look_ahead_mask: Optional[np.ndarray],
+                              tgt_seq_len: int) -> Optional[np.ndarray]:
+        """Combine padding and look-ahead masks into a single decoder mask.
+
+        Returns a mask shaped (1, 1, tgt_seq_len, tgt_seq_len) or (batch, 1, tgt_seq_len, tgt_seq_len)
+        where True indicates masked positions.
+        """
+        # Normalize look-ahead mask to shape (1, 1, L, L) boolean
+        la_mask = None
+        if look_ahead_mask is not None:
+            if look_ahead_mask.dtype != bool:
+                la_mask = look_ahead_mask.astype(bool)
+            else:
+                la_mask = look_ahead_mask
+            if la_mask.ndim == 2:
+                la_mask = la_mask.reshape(1, 1, tgt_seq_len, tgt_seq_len)
+            elif la_mask.ndim == 4:
+                pass
+            else:
+                # Fallback to causal mask if unexpected shape
+                la_mask = self._create_causal_mask(tgt_seq_len)
+
+        # Convert padding mask (batch, L) or (batch, L) floats to (batch, 1, 1, L) bool True=masked
+        pad_mask = None
+        if tgt_padding_mask is not None:
+            if tgt_padding_mask.ndim == 2:
+                # Incoming mask may be 1 for real tokens, 0 for pad (DataLoader)
+                # Convert to True for pad positions
+                pad_bool = (tgt_padding_mask == 0)
+                pad_mask = pad_bool.reshape(pad_bool.shape[0], 1, 1, pad_bool.shape[1])
+            elif tgt_padding_mask.ndim == 4:
+                pad_mask = tgt_padding_mask.astype(bool)
+
+        if la_mask is None and pad_mask is None:
+            return None
+
+        if la_mask is None:
+            return pad_mask
+        if pad_mask is None:
+            return la_mask
+
+        # Broadcast and combine (logical OR for masking)
+        if la_mask.shape[0] == 1 and pad_mask.shape[0] > 1:
+            la_mask = np.repeat(la_mask, pad_mask.shape[0], axis=0)
+        return np.logical_or(la_mask, pad_mask)
+
+    def beam_search(self, src_tokens: np.ndarray, max_length: int,
+                    beam_size: int = 4,
+                    start_token: int = 1, end_token: int = 2,
+                    length_penalty: float = 1.0) -> np.ndarray:
+        """Beam search decoding (NumPy implementation, batch size 1 or more).
+
+        Returns array of shape (batch_size, <=max_length) with the best sequence per item.
+        """
+        batch_size = src_tokens.shape[0]
+        # Encode once
+        encoder_output, _ = self.encode(src_tokens)
+
+        # Initialize beams
+        sequences = [
+            [(np.array([start_token], dtype=np.int64), 0.0)] for _ in range(batch_size)
+        ]
+
+        for _ in range(max_length - 1):
+            new_sequences = []
+            for b in range(batch_size):
+                candidates = []
+                for seq, score in sequences[b]:
+                    if seq[-1] == end_token:
+                        candidates.append((seq, score))
+                        continue
+                    tgt_tokens = seq.reshape(1, -1)
+                    tgt_mask = self._create_causal_mask(tgt_tokens.shape[1])
+                    logits, _ = self.forward(src_tokens[b:b+1], tgt_tokens, look_ahead_mask=tgt_mask)
+                    next_logits = logits[:, -1, :]
+                    # Softmax probabilities
+                    logits_shifted = next_logits - np.max(next_logits, axis=-1, keepdims=True)
+                    probs = np.exp(logits_shifted)
+                    probs = probs / np.sum(probs, axis=-1, keepdims=True)
+                    # Select top-k tokens
+                    topk_idx = np.argpartition(-probs[0], kth=min(beam_size, probs.shape[1]-1))[:beam_size]
+                    topk_idx = topk_idx[np.argsort(-probs[0, topk_idx])]
+                    for token_id in topk_idx:
+                        new_seq = np.concatenate([seq, np.array([token_id], dtype=np.int64)], axis=0)
+                        # Length-normalized log-prob score
+                        new_score = score + float(np.log(probs[0, token_id] + 1e-12)) / ((len(new_seq)) ** length_penalty)
+                        candidates.append((new_seq, new_score))
+                # Keep best beams
+                ordered = sorted(candidates, key=lambda x: x[1], reverse=True)[:beam_size]
+                new_sequences.append(ordered)
+            sequences = new_sequences
+
+            # Early stop if all beams in all batches ended
+            all_ended = all(all(seq[-1] == end_token for seq, _ in beams) for beams in sequences)
+            if all_ended:
+                break
+
+        # Select best sequence for each batch
+        best = []
+        for beams in sequences:
+            best_seq, _ = max(beams, key=lambda x: x[1])
+            best.append(best_seq)
+
+        # Pad to same length for return
+        max_len = max(len(s) for s in best)
+        out = np.full((batch_size, max_len), end_token, dtype=np.int64)
+        for i, s in enumerate(best):
+            out[i, :len(s)] = s
+        return out
     
     def get_parameters(self) -> dict:
         """Get all parameters for saving/loading."""

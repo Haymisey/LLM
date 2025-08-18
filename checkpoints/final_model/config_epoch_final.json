@@ -1,0 +1,17 @@
+{
+  "model_config": {
+    "d_model": 512,
+    "n_heads": 8,
+    "d_ff": 2048,
+    "n_encoder_layers": 3,
+    "n_decoder_layers": 3,
+    "dropout_rate": 0.1
+  },
+  "training_config": {
+    "initial_samples": 10000,
+    "epochs_per_stage": 3,
+    "samples_per_increase": 20000,
+    "learning_rate": 0.001,
+    "batch_size": 16
+  }
+}

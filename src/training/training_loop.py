@@ -123,14 +123,29 @@ class TrainingLoop:
         target_padding_mask = batch['target_padding_mask']
         look_ahead_mask = batch['look_ahead_mask']
         
+        # Teacher forcing: shift decoder inputs and labels by one
+        # decoder_input: SOS ... y_{T-1}; labels: y_1 ... EOS
+        decoder_input = target[:, :-1]
+        labels = target[:, 1:]
+
+        # Shift target padding mask to align with labels
+        target_padding_mask_shifted = target_padding_mask[:, 1:]
+
+        # Build look-ahead mask for current decoder length (boolean True = masked)
+        dec_len = decoder_input.shape[1]
+        causal = np.triu(np.ones((dec_len, dec_len)), k=1).astype(bool).reshape(1, 1, dec_len, dec_len)
+
         # Forward pass through model
-        logits, _ = self.model.forward(source, target, 
-                                      source_padding_mask, 
-                                      target_padding_mask, 
-                                      look_ahead_mask)
+        logits, _ = self.model.forward(
+            source,
+            decoder_input,
+            source_padding_mask,
+            target_padding_mask_shifted,
+            causal
+        )
         
-        # Compute loss
-        loss = self.loss_fn.forward(logits, target, target_padding_mask)
+        # Compute loss on shifted labels
+        loss = self.loss_fn.forward(logits, labels, target_padding_mask_shifted)
         
         # Backward pass
         grad_logits = self.loss_fn.backward()
@@ -313,22 +328,33 @@ class ValidationLoop:
         target_padding_mask = batch['target_padding_mask']
         look_ahead_mask = batch['look_ahead_mask']
         
+        # Teacher forcing with shift for evaluation
+        decoder_input = target[:, :-1]
+        labels = target[:, 1:]
+        target_padding_mask_shifted = target_padding_mask[:, 1:]
+
+        dec_len = decoder_input.shape[1]
+        causal = np.triu(np.ones((dec_len, dec_len)), k=1).astype(bool).reshape(1, 1, dec_len, dec_len)
+
         # Forward pass through model (no gradients)
-        logits, _ = self.model.forward(source, target, 
-                                      source_padding_mask, 
-                                      target_padding_mask, 
-                                      look_ahead_mask)
+        logits, _ = self.model.forward(
+            source,
+            decoder_input,
+            source_padding_mask,
+            target_padding_mask_shifted,
+            causal
+        )
         
         # Compute loss (we need to create a loss function instance)
         from .loss_functions import CrossEntropyLoss
         loss_fn = CrossEntropyLoss()
-        loss = loss_fn.forward(logits, target, target_padding_mask)
+        loss = loss_fn.forward(logits, labels, target_padding_mask_shifted)
         
         # Get predictions
         predictions = np.argmax(logits, axis=-1)
         
         # Update metrics
-        self.metrics.update(predictions, target, logits, target_padding_mask)
+        self.metrics.update(predictions, labels, logits, target_padding_mask_shifted)
         
         return loss, self.metrics.get_metrics()
     
